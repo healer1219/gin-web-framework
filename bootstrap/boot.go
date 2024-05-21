@@ -4,8 +4,8 @@ import (
 	"context"
 	"github.com/gin-gonic/gin"
 	"github.com/healer1219/martini/cloud"
-	"github.com/healer1219/martini/config"
 	"github.com/healer1219/martini/global"
+	"github.com/healer1219/martini/mevent"
 	"github.com/healer1219/martini/mlog"
 	"github.com/healer1219/martini/routes"
 	"log"
@@ -16,12 +16,60 @@ import (
 	"time"
 )
 
-type StartFunc func()
-type ShutDownFunc func()
+func init() {
+	InitConfig()
+	mlog.InitLog()
+}
 
-type BootOption func() *global.Application
+const (
+	BootupEvent   = mevent.EventType("bootup")
+	ShutdownEvent = mevent.EventType("shutdown")
+	StartupEvent  = mevent.EventType("startup")
+)
 
-type Application struct {
+type StartFunc func(ctx *global.Context)
+
+type StartEventHandler struct {
+	StartFunc
+}
+
+func (b *StartEventHandler) OnEvent(ctx *global.Context) {
+	b.StartFunc(ctx)
+}
+
+type ShutDownFunc func(ctx *global.Context)
+
+type ShutDownEventHandler struct {
+	ShutDownFunc
+}
+
+func (b *ShutDownEventHandler) OnEvent(ctx *global.Context) {
+	b.ShutDownFunc(ctx)
+}
+
+type BootOption func(ctx *global.Context)
+
+type BootEventHandler struct {
+	BootOption
+}
+
+func (b *BootEventHandler) OnEvent(ctx *global.Context) {
+	b.BootOption(ctx)
+}
+
+func parseEvent(fc func(ctx *global.Context), eventType mevent.EventType) mevent.Event {
+	switch eventType {
+	case BootupEvent:
+		return &BootEventHandler{fc}
+	case ShutdownEvent:
+		return &ShutDownEventHandler{fc}
+	case StartupEvent:
+		return &StartEventHandler{fc}
+	}
+	return nil
+}
+
+type Bootstrap struct {
 	engine          *gin.Engine
 	bootOpts        []BootOption
 	startOpts       []StartFunc
@@ -32,17 +80,12 @@ type Application struct {
 	registry        cloud.ServiceRegistry
 }
 
-var baseBootOption = []BootOption{
-	config.InitConfig,
-	mlog.InitLog,
-}
-
-func Default() *Application {
+func Default() *Bootstrap {
 	app := NewApplicationWithOpts()
 	return app
 }
 
-func NewApplicationWithOpts(opts ...BootOption) *Application {
+func NewApplicationWithOpts(opts ...BootOption) *Bootstrap {
 	return NewApplication(
 		newGin(),
 		opts,
@@ -52,9 +95,6 @@ func NewApplicationWithOpts(opts ...BootOption) *Application {
 }
 
 func newGin() *gin.Engine {
-	for _, bootOpt := range baseBootOption {
-		bootOpt()
-	}
 	engine := gin.New()
 	engine.Use(
 		mlog.LoggerMiddleWare(global.Logger()),
@@ -63,8 +103,8 @@ func newGin() *gin.Engine {
 	return engine
 }
 
-func NewApplication(engine *gin.Engine, bootOpts []BootOption, startOpts []StartFunc, globalApp *global.Application) *Application {
-	return &Application{
+func NewApplication(engine *gin.Engine, bootOpts []BootOption, startOpts []StartFunc, globalApp *global.Application) *Bootstrap {
+	return &Bootstrap{
 		engine:    engine,
 		bootOpts:  bootOpts,
 		startOpts: startOpts,
@@ -72,7 +112,7 @@ func NewApplication(engine *gin.Engine, bootOpts []BootOption, startOpts []Start
 	}
 }
 
-func (app *Application) BootOpt(bootOpts ...BootOption) *Application {
+func (app *Bootstrap) BootOpt(bootOpts ...BootOption) *Bootstrap {
 	if app.bootOpts == nil {
 		app.bootOpts = bootOpts
 	} else {
@@ -81,7 +121,7 @@ func (app *Application) BootOpt(bootOpts ...BootOption) *Application {
 	return app
 }
 
-func (app *Application) StartFunc(startOpts ...StartFunc) *Application {
+func (app *Bootstrap) StartFunc(startOpts ...StartFunc) *Bootstrap {
 	if app.startOpts == nil {
 		app.startOpts = startOpts
 	} else {
@@ -90,7 +130,7 @@ func (app *Application) StartFunc(startOpts ...StartFunc) *Application {
 	return app
 }
 
-func (app *Application) ShutDownFunc(shutDownOpts ...ShutDownFunc) *Application {
+func (app *Bootstrap) ShutDownFunc(shutDownOpts ...ShutDownFunc) *Bootstrap {
 	if app.shutDownOpts == nil {
 		app.shutDownOpts = shutDownOpts
 	} else {
@@ -99,12 +139,12 @@ func (app *Application) ShutDownFunc(shutDownOpts ...ShutDownFunc) *Application 
 	return app
 }
 
-func (app *Application) Router(opts ...routes.RouteOption) *Application {
+func (app *Bootstrap) Router(opts ...routes.RouteOption) *Bootstrap {
 	routes.Register(opts...)
 	return app
 }
 
-func (app *Application) Use(middleware ...gin.HandlerFunc) *Application {
+func (app *Bootstrap) Use(middleware ...gin.HandlerFunc) *Bootstrap {
 	if app.middleWares == nil {
 		app.middleWares = middleware
 	} else {
@@ -113,19 +153,19 @@ func (app *Application) Use(middleware ...gin.HandlerFunc) *Application {
 	return app
 }
 
-func (app *Application) Discovery(serviceInstance cloud.ServiceInstance, registry cloud.ServiceRegistry) *Application {
+func (app *Bootstrap) Discovery(serviceInstance cloud.ServiceInstance, registry cloud.ServiceRegistry) *Bootstrap {
 	app.serviceInstance = serviceInstance
 	app.registry = registry
-	app.StartFunc(func() {
+	app.StartFunc(func(ctx *global.Context) {
 		registry.Register(serviceInstance)
 	})
-	app.ShutDownFunc(func() {
+	app.ShutDownFunc(func(ctx *global.Context) {
 		registry.Deregister()
 	})
 	return app
 }
 
-func (app *Application) DefaultDiscovery() *Application {
+func (app *Bootstrap) DefaultDiscovery() *Bootstrap {
 	instance, err := cloud.NewDefaultServiceInstance()
 	if err != nil {
 		log.Fatal(err)
@@ -145,20 +185,27 @@ func (app *Application) DefaultDiscovery() *Application {
 	return app.Discovery(instance, serviceRegistry)
 }
 
-func (app *Application) BootUp() {
+func (app *Bootstrap) BootUp() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	for _, bootOpt := range app.bootOpts {
-		bootOpt()
+		event := parseEvent(bootOpt, BootupEvent)
+		mevent.AddBlock(BootupEvent, event)
 	}
+	mevent.Publish(BootupEvent)
+
 	for _, middleWare := range app.middleWares {
 		app.engine.Use(middleWare)
 	}
 	routes.SetupRouter(app.engine)
+
 	for _, startOpt := range app.startOpts {
-		startOpt()
+		event := parseEvent(startOpt, StartupEvent)
+		mevent.AddBlock(StartupEvent, event)
 	}
+	mevent.Publish(StartupEvent)
+
 	global.App.Logger.Info("starting ------ ----- --- ")
 	server := &http.Server{
 		Addr:    ":" + strconv.Itoa(app.globalApp.Config.App.Port),
@@ -174,8 +221,10 @@ func (app *Application) BootUp() {
 
 	<-ctx.Done()
 	for _, shutDownOpt := range app.shutDownOpts {
-		shutDownOpt()
+		event := parseEvent(shutDownOpt, ShutdownEvent)
+		mevent.AddBlock(ShutdownEvent, event)
 	}
+	mevent.Publish(ShutdownEvent)
 	stop()
 	log.Println("application is shutting down")
 
